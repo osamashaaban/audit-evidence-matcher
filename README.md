@@ -9,6 +9,7 @@ After cloning the repo:
 ```bash
 bash run_demo.sh
 ```
+Also check the run_demo.sh file to be aware about steps and change conda environment's name.
 
 This single command creates the conda environment, installs all dependencies, configures the project, and launches the Streamlit dashboard. The app opens at **http://localhost:8501**.
 
@@ -18,7 +19,7 @@ This single command creates the conda environment, installs all dependencies, co
 conda create -n osama-env python=3.11 -y
 conda activate osama-env
 pip install -r requirements.txt
-cp .env.example .env   # edit with your OpenAI API key
+.env   # edit with your OpenAI API key
 streamlit run app/dashboard/streamlit_app.py
 ```
 
