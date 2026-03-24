@@ -1,12 +1,12 @@
 """
-LLM Judge — Final decision and explanation generation using OpenAI gpt-4o-mini.
+LLM Explainer — generates natural-language explanations using gpt-4o-mini.
 
-Req 4.4: "optional single LLM call per invoice to produce a
-          structured decision + explanation from top candidates"
+Exactly ONE API call per invoice. The LLM does NOT make the match decision —
+it only explains the result that the deterministic scoring already decided.
 
-Req 5: "If using an LLM, prefer at most one call per invoice."
-
-Exactly ONE LLM call per invoice.
+Req 4.4: "optional single LLM call per invoice to produce a structured
+          decision + explanation from top candidates"
+Req 5:   "If using an LLM, prefer at most one call per invoice."
 """
 
 from __future__ import annotations
@@ -14,7 +14,6 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Optional
 
 from app.config import LLMConfig
 from app.cost_logger import cost_logger
@@ -24,57 +23,45 @@ logger = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────
-# Prompt Template
+# Prompt
 # ──────────────────────────────────────────────
 
-JUDGE_SYSTEM_PROMPT = """You are a financial auditor matching invoices to journal entries.
-You will receive an invoice and a ranked list of candidate journal entry groups.
-Each candidate includes similarity scores and field-level evidence.
+SYSTEM_PROMPT = """You are a financial auditor explaining invoice-to-journal matching results.
+You will receive an invoice, a ranked list of candidate journal groups with scores and
+field-level evidence, and the system's decision (MATCHED or NO_MATCH).
 
-Your task:
-1. Analyze each candidate against the invoice.
-2. Decide the BEST match or determine NO_MATCH.
-3. Provide a clear explanation for your decision.
+Your task: explain WHY the decision is correct based on the evidence provided.
 
 Rules:
 - Invoice number match is the STRONGEST signal.
-- If no candidate has a matching invoice number AND matching vendor, return NO_MATCH.
-- Amount differences may exist due to accounting splits (base + VAT as separate lines).
-- A high vector similarity alone is NOT sufficient — verify with field evidence.
+- If no candidate has a matching invoice number AND matching vendor, NO_MATCH is correct.
+- Amount differences may exist due to VAT splits (base + VAT as separate journal lines).
 - Be skeptical of near-matches: ORION-403 is NOT the same as ORION-404.
 
-Respond with ONLY valid JSON, no markdown, no backticks."""
+Respond with ONLY valid JSON:
+{
+  "explanation": "2-3 sentences explaining why the match was chosen or why no match exists",
+  "candidates_analysis": [
+    {"journal_ref": "...", "relevance": "high/medium/low", "rationale": "1 sentence"}
+  ]
+}"""
 
-JUDGE_USER_TEMPLATE = """## Invoice (Evidence Document)
+USER_TEMPLATE = """## Invoice
 - Vendor: {vendor_name}
 - Invoice No: {invoice_no}
 - Date: {invoice_date}
-- Subtotal: {subtotal}
-- VAT: {vat_amount}
 - Total: {total_amount} {currency}
 - VAT ID: {vat_id}
-- Payment Terms: {payment_terms}
 
-## Top Candidate Journal Groups (ranked by combined score)
-{candidates_text}
+## System Decision: {decision}
+{match_info}
 
-## Required JSON Response Format
-{{
-  "decision": "MATCHED" or "NO_MATCH",
-  "best_match_journal_ref": "journal_ref string or null",
-  "confidence": 0.0 to 1.0,
-  "explanation": "2-3 sentences explaining why this is the best match or why no match exists",
-  "candidates_analysis": [
-    {{
-      "journal_ref": "...",
-      "relevance": "high/medium/low",
-      "rationale": "1 sentence explaining why this candidate does or does not match"
-    }}
-  ]
-}}"""
+## Top Candidates (ranked by deterministic score)
+{candidates_text}"""
 
 
 def _format_candidates(candidates: list[MatchCandidate]) -> str:
+    """Format top candidates for the LLM prompt."""
     parts = []
     for i, c in enumerate(candidates, 1):
         evidence = c.evidence or {}
@@ -86,12 +73,8 @@ def _format_candidates(candidates: list[MatchCandidate]) -> str:
 
         parts.append(
             f"### Candidate {i}: {c.journal_ref}\n"
-            f"- Vendor: {c.vendor_name}\n"
-            f"- Invoice No: {c.invoice_no}\n"
-            f"- Total Amount: {c.total_amount}\n"
-            f"- Combined Score: {c.combined_score:.3f}\n"
-            f"- Vector Similarity: {c.vector_score:.3f}\n"
             f"- Deterministic Score: {c.deterministic_score:.3f}\n"
+            f"- Vector Similarity: {c.vector_score:.3f}\n"
             f"- Invoice # Match: {inv_ev.get('matched', 'N/A')} "
             f"(similarity: {inv_ev.get('similarity', 'N/A')})\n"
             f"- Vendor Match: {vendor_ev.get('matched', 'N/A')} "
@@ -106,185 +89,162 @@ def _format_candidates(candidates: list[MatchCandidate]) -> str:
 
 
 # ──────────────────────────────────────────────
-# LLM Judge
+# Explainer
 # ──────────────────────────────────────────────
 
-class LLMJudge:
-    """Makes final match decision with LLM-generated explanation. One call per invoice."""
+def explain(
+    invoice: Invoice,
+    candidates: list[MatchCandidate],
+    decision: str,
+    best_match: str | None,
+    config: LLMConfig,
+) -> dict:
+    """
+    Generate explanation for the matching result. One API call.
 
-    def __init__(self, config: LLMConfig):
-        self.config = config
-        self._client = None
+    Args:
+        invoice: The invoice being matched.
+        candidates: Ranked candidates (top 3 is enough).
+        decision: "MATCHED" or "NO_MATCH" (already decided by deterministic).
+        best_match: journal_ref of best match, or None.
+        config: LLM configuration.
 
-    def _get_client(self):
-        if self._client is not None:
-            return self._client
+    Returns:
+        {"explanation": "...", "candidates_analysis": [...]}
+    """
+    # Build prompt
+    match_info = ""
+    if decision == "MATCHED" and best_match:
+        match_info = f"Best match: {best_match} (score: {candidates[0].combined_score:.3f})"
+    else:
+        top_score = candidates[0].combined_score if candidates else 0
+        match_info = f"No match found. Closest candidate scored {top_score:.3f} (threshold: 0.60)"
+
+    user_prompt = USER_TEMPLATE.format(
+        vendor_name=invoice.vendor_name,
+        invoice_no=invoice.invoice_no,
+        invoice_date=invoice.invoice_date,
+        total_amount=invoice.total_amount,
+        currency=invoice.currency,
+        vat_id=invoice.vat_id or "N/A",
+        decision=decision,
+        match_info=match_info,
+        candidates_text=_format_candidates(candidates[:3]),
+    )
+
+    try:
         from openai import OpenAI
-        if not self.config.api_key:
-            raise ValueError("OpenAI API key is required. Set OPENAI_API_KEY in .env.")
-        self._client = OpenAI(
-            api_key=self.config.api_key,
-            base_url=self.config.base_url,
-        )
-        return self._client
 
-    def judge(self, invoice: Invoice, candidates: list[MatchCandidate]) -> dict:
-        """Make final decision for one invoice. Exactly 1 API call."""
-        client = self._get_client()
+        if not config.api_key:
+            return _build_explanation_from_evidence(candidates, decision, best_match)
 
-        user_prompt = JUDGE_USER_TEMPLATE.format(
-            vendor_name=invoice.vendor_name,
-            invoice_no=invoice.invoice_no,
-            invoice_date=invoice.invoice_date,
-            subtotal=invoice.subtotal,
-            vat_amount=invoice.vat_amount,
-            total_amount=invoice.total_amount,
-            currency=invoice.currency,
-            vat_id=invoice.vat_id or "N/A",
-            payment_terms=invoice.payment_terms or "N/A",
-            candidates_text=_format_candidates(candidates),
+        client = OpenAI(api_key=config.api_key, base_url=config.base_url)
+
+        response = client.chat.completions.create(
+            model=config.model_name,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=config.temperature,
+            max_tokens=config.max_tokens,
+            response_format={"type": "json_object"},
         )
 
-        try:
-            response = client.chat.completions.create(
-                model=self.config.model_name,
-                messages=[
-                    {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=self.config.temperature,
-                max_tokens=self.config.max_tokens,
-                response_format={"type": "json_object"},
-            )
+        raw = response.choices[0].message.content
 
-            raw_content = response.choices[0].message.content
-            result = self._parse_response(raw_content)
+        # Cost logging
+        usage = response.usage
+        input_tokens = usage.prompt_tokens if usage else 0
+        output_tokens = usage.completion_tokens if usage else 0
+        cost = (
+            (input_tokens / 1_000_000) * config.input_cost_per_1m
+            + (output_tokens / 1_000_000) * config.output_cost_per_1m
+        )
 
-            # Cost logging
-            usage = response.usage
-            input_tokens = usage.prompt_tokens if usage else 0
-            output_tokens = usage.completion_tokens if usage else 0
-            cost = (
-                (input_tokens / 1_000_000) * self.config.input_cost_per_1m
-                + (output_tokens / 1_000_000) * self.config.output_cost_per_1m
-            )
+        cost_logger.log(
+            stage="llm_judge",
+            provider="openai",
+            model=config.model_name,
+            operation=f"explain_{invoice.invoice_no}",
+            num_calls=1,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            estimated_cost_usd=cost,
+        )
 
-            cost_logger.log(
-                stage="llm_judge",
-                provider="openai",
-                model=self.config.model_name,
-                operation=f"judge_{invoice.invoice_no}",
-                num_calls=1,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                estimated_cost_usd=cost,
-            )
+        result = _parse_response(raw)
 
-            logger.info(
-                f"LLM judge for {invoice.invoice_no}: "
-                f"{result.get('decision', '?')} "
-                f"(confidence: {result.get('confidence', 0):.2f})"
-            )
-            return result
-
-        except Exception as e:
-            logger.error(f"LLM judge failed for {invoice.invoice_no}: {e}")
-            return self._fallback_result(invoice, candidates, str(e))
-
-    def _parse_response(self, raw: str) -> dict:
-        cleaned = raw.strip()
-        if cleaned.startswith("```"):
-            lines = cleaned.split("\n")
-            lines = [l for l in lines if not l.strip().startswith("```")]
-            cleaned = "\n".join(lines).strip()
-
-        try:
-            result = json.loads(cleaned)
-        except json.JSONDecodeError:
-            json_match = re.search(r'\{[\s\S]*\}', cleaned)
-            if json_match:
-                try:
-                    result = json.loads(json_match.group())
-                except json.JSONDecodeError:
-                    result = {}
-            else:
-                result = {}
-
-        result.setdefault("decision", "NO_MATCH")
-        result.setdefault("best_match_journal_ref", None)
-        result.setdefault("confidence", 0.0)
-        result.setdefault("explanation", "LLM response could not be fully parsed.")
-        result.setdefault("candidates_analysis", [])
-
-        decision = result["decision"].upper().strip()
-        result["decision"] = "MATCHED" if decision in ("MATCHED", "MATCH") else "NO_MATCH"
-
-        try:
-            result["confidence"] = float(result["confidence"])
-        except (ValueError, TypeError):
-            result["confidence"] = 0.0
-
+        logger.info(
+            f"LLM explanation for {invoice.invoice_no}: "
+            f"{len(result.get('explanation', ''))} chars"
+        )
         return result
 
-    def _fallback_result(self, invoice: Invoice, candidates: list[MatchCandidate], error: str) -> dict:
-        if candidates and candidates[0].combined_score >= 0.60:
-            best = candidates[0]
-            return {
-                "decision": "MATCHED",
-                "best_match_journal_ref": best.journal_ref,
-                "confidence": round(best.combined_score, 2),
-                "explanation": f"LLM unavailable ({error}). Decision based on deterministic scoring.",
-                "candidates_analysis": [],
+    except Exception as e:
+        logger.error(f"LLM explanation failed for {invoice.invoice_no}: {e}")
+        return _build_explanation_from_evidence(candidates, decision, best_match)
+
+
+def _parse_response(raw: str) -> dict:
+    """Parse LLM JSON response with fallbacks."""
+    cleaned = raw.strip()
+
+    # Strip markdown backticks if present
+    if cleaned.startswith("```"):
+        lines = cleaned.split("\n")
+        lines = [l for l in lines if not l.strip().startswith("```")]
+        cleaned = "\n".join(lines).strip()
+
+    try:
+        result = json.loads(cleaned)
+    except json.JSONDecodeError:
+        # Try to find JSON object in the text
+        json_match = re.search(r'\{[\s\S]*\}', cleaned)
+        if json_match:
+            try:
+                result = json.loads(json_match.group())
+            except json.JSONDecodeError:
+                result = {}
+        else:
+            result = {}
+
+    result.setdefault("explanation", "")
+    result.setdefault("candidates_analysis", [])
+    return result
+
+
+def _build_explanation_from_evidence(
+    candidates: list[MatchCandidate],
+    decision: str,
+    best_match: str | None,
+) -> dict:
+    """
+    Build explanation from deterministic evidence when LLM is unavailable.
+    """
+    if decision == "MATCHED" and candidates:
+        best = candidates[0]
+        explanation = (
+            f"Matched to {best.journal_ref} with deterministic score "
+            f"{best.combined_score:.2f}. {best.rationale}"
+        )
+    elif candidates:
+        best = candidates[0]
+        explanation = (
+            f"No match found. Closest candidate {best.journal_ref} scored "
+            f"{best.combined_score:.2f} (below 0.60 threshold). {best.rationale}"
+        )
+    else:
+        explanation = "No candidates found in the vector store."
+
+    return {
+        "explanation": explanation,
+        "candidates_analysis": [
+            {
+                "journal_ref": c.journal_ref,
+                "relevance": "high" if c.combined_score > 0.5 else "low",
+                "rationale": c.rationale,
             }
-        return {
-            "decision": "NO_MATCH",
-            "best_match_journal_ref": None,
-            "confidence": 0.7,
-            "explanation": f"LLM unavailable ({error}). No candidate scored above threshold.",
-            "candidates_analysis": [],
-        }
-
-
-class NoOpJudge:
-    """Fallback judge using deterministic scores only (no LLM call)."""
-
-    def judge(self, invoice: Invoice, candidates: list[MatchCandidate]) -> dict:
-        if candidates and candidates[0].combined_score >= 0.60:
-            best = candidates[0]
-            return {
-                "decision": "MATCHED",
-                "best_match_journal_ref": best.journal_ref,
-                "confidence": round(best.combined_score, 2),
-                "explanation": (
-                    f"Matched based on deterministic scoring. "
-                    f"Best candidate {best.journal_ref} scored {best.combined_score:.2f}. "
-                    f"{best.rationale}"
-                ),
-                "candidates_analysis": [
-                    {"journal_ref": c.journal_ref,
-                     "relevance": "high" if c.combined_score > 0.5 else "low",
-                     "rationale": c.rationale}
-                    for c in candidates[:3]
-                ],
-            }
-        return {
-            "decision": "NO_MATCH",
-            "best_match_journal_ref": None,
-            "confidence": 0.8,
-            "explanation": (
-                "No candidate scored above the match threshold. "
-                + (f"Closest: {candidates[0].journal_ref} ({candidates[0].combined_score:.2f}): "
-                   f"{candidates[0].rationale}" if candidates else "No candidates.")
-            ),
-            "candidates_analysis": [
-                {"journal_ref": c.journal_ref, "relevance": "low", "rationale": c.rationale}
-                for c in candidates[:3]
-            ],
-        }
-
-
-def get_llm_judge(config: LLMConfig, enabled: bool = True):
-    if not enabled:
-        logger.info("LLM judge disabled — using deterministic-only fallback")
-        return NoOpJudge()
-    return LLMJudge(config)
+            for c in candidates[:3]
+        ],
+    }

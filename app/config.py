@@ -39,7 +39,7 @@ class EmbeddingConfig:
     api_key: str = ""
     base_url: str = "https://api.openai.com/v1"
     batch_size: int = 32
-    cost_per_1m_tokens: float = 0.02  # text-embedding-3-small pricing
+    cost_per_1m_tokens: float = 0.02
 
     def __post_init__(self):
         if not self.api_key:
@@ -57,24 +57,12 @@ class LLMConfig:
     base_url: str = "https://api.openai.com/v1"
     temperature: float = 0.0
     max_tokens: int = 1000
-    input_cost_per_1m: float = 0.15   # gpt-4o-mini input
-    output_cost_per_1m: float = 0.60  # gpt-4o-mini output
+    input_cost_per_1m: float = 0.15
+    output_cost_per_1m: float = 0.60
 
     def __post_init__(self):
         if not self.api_key:
             self.api_key = os.getenv("OPENAI_API_KEY", "")
-
-
-# ──────────────────────────────────────────────
-# Reranker Config (disabled — OpenAI has no reranker endpoint)
-# ──────────────────────────────────────────────
-
-@dataclass
-class RerankerConfig:
-    enabled: bool = False
-    model_name: str = ""
-    top_k_input: int = 10
-    top_k_output: int = 5
 
 
 # ──────────────────────────────────────────────
@@ -114,7 +102,7 @@ class MatchingConfig:
     match_threshold: float = 0.60
     min_candidates_to_show: int = 3
 
-    # LLM judge
+    # LLM explanation
     use_llm_judge: bool = True
 
 
@@ -126,7 +114,6 @@ class MatchingConfig:
 class AppConfig:
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
-    reranker: RerankerConfig = field(default_factory=RerankerConfig)
     vector_store: VectorStoreConfig = field(default_factory=VectorStoreConfig)
     matching: MatchingConfig = field(default_factory=MatchingConfig)
 
